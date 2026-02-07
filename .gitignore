@@ -24,11 +24,21 @@ ENV/
 .DS_Store
 Thumbs.db
 
-# Downloaded videos
+# Downloaded videos/audio
 *.mp4
 *.mp3
 *.webm
 *.mkv
 
+# Subtitles and transcripts (generated output)
+*.vtt
+*.srt
+
 # Cookies
 cookies.txt
+
+# Metadata (generated)
+.meta.json
+
+# Whisper temp segments
+whisper_segments_*/
