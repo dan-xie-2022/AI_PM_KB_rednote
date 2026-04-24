@@ -28,7 +28,7 @@ Both must be available. If missing, instruct the user to install:
 ### Step 2: Get Video Information
 
 ```bash
-/opt/homebrew/Caskroom/miniconda/base/envs/myenv/bin/python scripts/download_xiaohongshu.py "URL" --list-formats
+python3 scripts/download_xiaohongshu.py "URL" --list-formats
 ```
 
 This shows available formats and verifies the URL works with cookie authentication.
@@ -38,22 +38,22 @@ This shows available formats and verifies the URL works with cookie authenticati
 For **basic download** (video only, backward compatible with v1.0):
 
 ```bash
-/opt/homebrew/Caskroom/miniconda/base/envs/myenv/bin/python scripts/download_xiaohongshu.py "URL"
+python3 scripts/download_xiaohongshu.py "URL" -o content/
 ```
 
 For **full resource pack** (video + audio + subtitles + transcript):
 
 ```bash
-/opt/homebrew/Caskroom/miniconda/base/envs/myenv/bin/python scripts/download_xiaohongshu.py "URL" --full
+python3 scripts/download_xiaohongshu.py "URL" --full -o content/
 ```
 
 For **full resource pack + AI summary preparation**:
 
 ```bash
-/opt/homebrew/Caskroom/miniconda/base/envs/myenv/bin/python scripts/download_xiaohongshu.py "URL" --summary
+python3 scripts/download_xiaohongshu.py "URL" --summary -o content/
 ```
 
-The `--full` flag creates a folder `~/Downloads/<video title>/` containing:
+The `--full` flag creates a folder `content/<video title>/` containing:
 - `video.mp4` — original video
 - `audio.mp3` — extracted audio
 - `subtitle.vtt` — WebVTT subtitles (via 3-tier strategy)
@@ -78,12 +78,12 @@ If the user requested a summary (via `--summary` flag or by asking to "summarize
 
 1. Read the transcript file:
    ```
-   ~/Downloads/<video title>/transcript.txt
+   content/<video title>/transcript.txt
    ```
 
 2. Read the metadata file:
    ```
-   ~/Downloads/<video title>/.meta.json
+   content/<video title>/.meta.json
    ```
 
 3. Read the summary prompt template:
@@ -102,14 +102,14 @@ If the user requested a summary (via `--summary` flag or by asking to "summarize
 
 6. Save the result to:
    ```
-   ~/Downloads/<video title>/summary.md
+   content/<video title>/summary.md
    ```
 
 ## Options Reference
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-o, --output` | Output directory | `~/Downloads` |
+| `-o, --output` | Output directory | `content/` |
 | `-q, --quality` | Video quality (`best`, `1080p`, `720p`, `480p`) | `best` |
 | `--browser` | Browser for cookies (`chrome`, `firefox`, `safari`, `none`) | `chrome` |
 | `-a, --audio-only` | Download audio only as MP3 | `false` |
@@ -121,13 +121,13 @@ If the user requested a summary (via `--summary` flag or by asking to "summarize
 
 ### Basic mode (default)
 ```
-~/Downloads/
+content/
 └── <title> [<id>].mp4
 ```
 
 ### Full resource pack mode (`--full` or `--summary`)
 ```
-~/Downloads/<video title>/
+content/<video title>/
 ├── video.mp4          # Original video
 ├── audio.mp3          # Extracted audio
 ├── subtitle.vtt       # WebVTT subtitles
