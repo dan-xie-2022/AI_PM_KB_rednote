@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Xiaohongshu (小红书/RedNote) Video Downloader v2.0
-Downloads videos from Xiaohongshu and optionally produces a full resource pack:
-video + audio + subtitles + transcript + AI summary.
+Xiaohongshu (小红书/RedNote) Downloader v2.1
+Supports both video posts and image posts.
+- Video post: downloads video + optional audio/subtitles/transcript/AI summary
+- Image post: downloads all images + saves title and description as post.txt
 """
 
 import argparse
@@ -92,6 +93,76 @@ def sanitize_title(title):
     if len(sanitized) > 100:
         sanitized = sanitized[:100].rstrip()
     return sanitized or "untitled"
+
+
+def detect_post_type(info):
+    """Return 'video' or 'image' based on yt-dlp info dict."""
+    if not info:
+        return 'video'
+    formats = info.get('formats', [])
+    has_video_stream = any(
+        f.get('vcodec') not in (None, 'none', '')
+        for f in formats
+    )
+    if has_video_stream:
+        return 'video'
+    return 'image'
+
+
+def download_image_post(url, info, output_path, browser="chrome"):
+    """Download all images and text from a Xiaohongshu image post."""
+    title = info.get('title', 'untitled') if info else 'untitled'
+    description = info.get('description', '') if info else ''
+    uploader = info.get('uploader', 'Unknown') if info else 'Unknown'
+
+    safe_title = sanitize_title(title)
+    output_dir = os.path.join(output_path, safe_title)
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"Title: {title}")
+    print(f"Uploader: {uploader}")
+    print(f"Type: image post")
+    print(f"Output: {output_dir}\n")
+
+    # Download images; omit --no-playlist so multi-image galleries are fully fetched
+    cmd = ["yt-dlp"]
+    if browser and browser != "none":
+        cmd.extend(["--cookies-from-browser", browser])
+    cmd.extend([
+        "-o", os.path.join(output_dir, "%(autonumber)02d.%(ext)s"),
+    ])
+    cmd.append(url)
+
+    try:
+        subprocess.run(cmd, check=True)
+        print("\nImages downloaded!")
+    except subprocess.CalledProcessError as e:
+        print(f"\nError downloading images: {e}")
+        return False
+
+    # Save title + description to post.txt
+    text_path = os.path.join(output_dir, "post.txt")
+    with open(text_path, "w", encoding="utf-8") as f:
+        f.write(f"{title}\n")
+        if description and description.strip() != title.strip():
+            f.write(f"\n{description}\n")
+    print(f"Text saved: {text_path}")
+
+    # Print summary
+    image_exts = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+    images = sorted([
+        fname for fname in os.listdir(output_dir)
+        if os.path.splitext(fname)[1].lower() in image_exts
+    ])
+    print(f"\n{'='*50}")
+    print(f"Resource pack saved to: {output_dir}")
+    print(f"{'='*50}")
+    for img in images:
+        size_kb = os.path.getsize(os.path.join(output_dir, img)) / 1024
+        print(f"  {img:20s} {size_kb:>8.1f} KB")
+    print(f"  {'post.txt':20s} (title + description)")
+
+    return True
 
 
 def extract_audio(video_path, output_dir):
@@ -304,7 +375,7 @@ def download_video(url, output_path=None, quality="best", browser="chrome",
     if output_path is None:
         output_path = os.path.expanduser("~/Downloads")
 
-    # Get video info first
+    # Get post info first
     info = get_video_info(url, browser)
     title = "Unknown"
     duration = 0
@@ -313,6 +384,17 @@ def download_video(url, output_path=None, quality="best", browser="chrome",
         title = info.get("title", "Unknown")
         duration = int(info.get("duration", 0) or 0)
         uploader = info.get("uploader", "Unknown")
+
+    # Detect post type and dispatch to image handler if needed
+    post_type = detect_post_type(info)
+    if post_type == 'image':
+        print("Detected: image post (no video stream)\n")
+        if full_mode or summary_mode:
+            print("Note: --full and --summary are not applicable to image posts, ignored.\n")
+        return download_image_post(url, info, output_path, browser)
+
+    # --- Video post ---
+    if info:
         if duration:
             print(f"Title: {title}")
             print(f"Duration: {duration // 60}:{duration % 60:02d}")

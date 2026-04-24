@@ -1,31 +1,29 @@
 ---
 name: xiaohongshu-downloader
-description: Download and summarize Xiaohongshu (小红书/RedNote) videos. Produces a full resource pack with video, audio, subtitles, transcript, and AI summary. This skill should be used when the user asks to "download xiaohongshu video", "下载小红书视频", "save rednote video", "download from xiaohongshu", "小红书视频下载", "总结小红书视频", "summarize xiaohongshu video", or mentions downloading/summarizing content from xiaohongshu.com or xhslink.com.
-version: 2.0.0
+description: Download and summarize Xiaohongshu (小红书/RedNote) posts — both videos and image posts. Produces a full resource pack. This skill should be used when the user asks to "download xiaohongshu video", "下载小红书视频", "下载小红书图文", "save rednote post", "download from xiaohongshu", "小红书视频下载", "总结小红书视频", "summarize xiaohongshu video", or mentions downloading/summarizing content from xiaohongshu.com or xhslink.com.
+version: 2.1.0
 ---
 
-# Xiaohongshu Video Downloader & Summarizer
+# Xiaohongshu Downloader & Summarizer
 
-Download videos from Xiaohongshu (小红书/RedNote) and optionally generate a full resource pack: video + audio + subtitles + transcript + AI summary.
+Download posts from Xiaohongshu (小红书/RedNote). The script **automatically detects** whether the URL is a video post or an image post and handles each accordingly.
 
 ## Workflow
 
-Follow these 6 steps in order:
+Follow these steps in order:
 
 ### Step 1: Check Dependencies
-
-Verify required tools are installed:
 
 ```bash
 yt-dlp --version
 ffmpeg -version
 ```
 
-Both must be available. If missing, instruct the user to install:
+Both must be available. If missing:
 - `brew install yt-dlp` (macOS) or `pip install yt-dlp`
 - `brew install ffmpeg` (macOS)
 
-### Step 2: Get Video Information
+### Step 2: Get Post Information
 
 ```bash
 python3 scripts/download_xiaohongshu.py "URL" --list-formats
@@ -33,46 +31,51 @@ python3 scripts/download_xiaohongshu.py "URL" --list-formats
 
 This shows available formats and verifies the URL works with cookie authentication.
 
-### Step 3: Download Video + Extract Audio
+### Step 3: Download
 
-For **basic download** (video only, backward compatible with v1.0):
+The script auto-detects the post type. Use the same commands for both video and image posts:
+
+For **basic download**:
 
 ```bash
 python3 scripts/download_xiaohongshu.py "URL" -o content/
 ```
 
-For **full resource pack** (video + audio + subtitles + transcript):
+For **full resource pack** (video posts: + audio + subtitles + transcript; image posts: all images + text):
 
 ```bash
 python3 scripts/download_xiaohongshu.py "URL" --full -o content/
 ```
 
-For **full resource pack + AI summary preparation**:
+For **full resource pack + AI summary** (video posts only):
 
 ```bash
 python3 scripts/download_xiaohongshu.py "URL" --summary -o content/
 ```
 
-The `--full` flag creates a folder `content/<video title>/` containing:
+**Video post** — `--full` creates `content/<title>/` with:
 - `video.mp4` — original video
 - `audio.mp3` — extracted audio
 - `subtitle.vtt` — WebVTT subtitles (via 3-tier strategy)
 - `transcript.txt` — plain text transcription
 
-The `--summary` flag implies `--full` and additionally saves `.meta.json` for AI summary generation.
+**Image post** — always creates `content/<title>/` with:
+- `01.jpg`, `02.jpg`, … — all images in the post
+- `post.txt` — post title and description text
 
-### Step 4: Subtitle Acquisition (Automatic — 3-Tier Strategy)
+The `--summary` flag is ignored for image posts. For image posts, `--full` and the basic command produce the same result.
 
-The script automatically tries these strategies in order:
+### Step 4: Subtitle Acquisition — Video Posts Only (Automatic 3-Tier Strategy)
+
 1. **Manual subtitles** — `yt-dlp --write-subs --sub-lang zh,en,zh-Hans,zh-CN`
 2. **Auto-generated subtitles** — `yt-dlp --write-auto-subs`
 3. **Whisper local transcription** — Falls back to `parallel_transcribe.py` using faster-whisper
 
-### Step 5: Generate Transcript (Automatic)
+### Step 5: Generate Transcript — Video Posts Only (Automatic)
 
 The script automatically strips timestamps from VTT to produce `transcript.txt`.
 
-### Step 6: AI Summary (Claude generates summary.md)
+### Step 6: AI Summary — Video Posts Only (Claude generates summary.md)
 
 If the user requested a summary (via `--summary` flag or by asking to "summarize"):
 
@@ -119,13 +122,13 @@ If the user requested a summary (via `--summary` flag or by asking to "summarize
 
 ## Output Structure
 
-### Basic mode (default)
+### Video post — basic mode
 ```
 content/
 └── <title> [<id>].mp4
 ```
 
-### Full resource pack mode (`--full` or `--summary`)
+### Video post — full resource pack (`--full` or `--summary`)
 ```
 content/<video title>/
 ├── video.mp4          # Original video
@@ -134,6 +137,15 @@ content/<video title>/
 ├── transcript.txt     # Plain text transcript
 ├── .meta.json         # Video metadata (--summary only)
 └── summary.md         # AI-generated summary (--summary only, written by Claude)
+```
+
+### Image post — all modes
+```
+content/<post title>/
+├── 01.jpg             # First image
+├── 02.jpg             # Second image
+├── ...
+└── post.txt           # Post title + description
 ```
 
 ## Supported URL Formats
