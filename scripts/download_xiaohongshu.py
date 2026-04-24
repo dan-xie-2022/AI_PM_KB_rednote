@@ -39,10 +39,16 @@ def check_ffmpeg():
         return False
 
 
+def _normalize_url(url):
+    """Convert rednote.com URLs to xiaohongshu.com so yt-dlp can handle them."""
+    return url.replace('www.rednote.com', 'www.xiaohongshu.com')
+
+
 def validate_url(url):
     """Validate that the URL is a Xiaohongshu URL."""
     patterns = [
         r'https?://www\.xiaohongshu\.com/(?:explore|discovery/item)/[\da-f]+',
+        r'https?://www\.rednote\.com/(?:explore|discovery/item)/[\da-f]+',
         r'https?://xhslink\.com/',
     ]
     for pattern in patterns:
@@ -53,6 +59,7 @@ def validate_url(url):
 
 def get_video_info(url, browser="chrome"):
     """Get video information without downloading."""
+    url = _normalize_url(url)
     cmd = ["yt-dlp", "--dump-json", "--no-playlist"]
     if browser and browser != "none":
         cmd.extend(["--cookies-from-browser", browser])
@@ -66,16 +73,27 @@ def get_video_info(url, browser="chrome"):
         if "Unable to extract initial state" in stderr:
             print("Error: Anti-scraping CAPTCHA triggered.")
             print("Solution: Open the URL in your browser, solve the CAPTCHA, then retry.")
+            return None
         elif "No video formats found" in stderr:
-            print("Error: No video formats found.")
-            print("Solution: Make sure you're logged into xiaohongshu.com in your browser.")
+            # Image post — yt-dlp found the page but no video; treat as image post
+            # Try to salvage any partial JSON from stdout
+            if e.stdout and e.stdout.strip():
+                try:
+                    return json.loads(e.stdout)
+                except json.JSONDecodeError:
+                    pass
+            # Extract post ID from URL as fallback title
+            id_match = re.search(r'/explore/([0-9a-f]+)', url)
+            post_id = id_match.group(1) if id_match else 'unknown'
+            return {'_is_image_post': True, 'title': post_id, 'uploader': 'Unknown', 'description': ''}
         else:
             print(f"Error getting video info: {stderr}")
-        return None
+            return None
 
 
 def list_formats(url, browser="chrome"):
     """List all available formats for the video."""
+    url = _normalize_url(url)
     cmd = ["yt-dlp", "--list-formats", "--no-playlist"]
     if browser and browser != "none":
         cmd.extend(["--cookies-from-browser", browser])
@@ -99,6 +117,8 @@ def detect_post_type(info):
     """Return 'video' or 'image' based on yt-dlp info dict."""
     if not info:
         return 'video'
+    if info.get('_is_image_post'):
+        return 'image'
     formats = info.get('formats', [])
     has_video_stream = any(
         f.get('vcodec') not in (None, 'none', '')
@@ -109,9 +129,128 @@ def detect_post_type(info):
     return 'image'
 
 
+_MOBILE_UA = (
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) '
+    'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
+)
+
+
+def _parse_mobile_state(html):
+    """Parse window.__INITIAL_STATE__ from mobile-UA page response.
+
+    XHS serves a different SSR payload for mobile UAs that includes the full
+    note data (imageList, title, desc) under state.noteData.data.noteData.
+
+    Returns (image_urls, title, description) or ([], '', '') on failure.
+    """
+    idx = html.find('window.__INITIAL_STATE__')
+    if idx == -1:
+        return [], '', ''
+    raw = html[idx + len('window.__INITIAL_STATE__='):]
+    end = raw.find('</script>')
+    raw = raw[:end].rstrip('; \n\r')
+    raw = re.sub(r':\s*undefined\b', ': null', raw)
+    try:
+        state = json.loads(raw)
+    except json.JSONDecodeError:
+        return [], '', ''
+
+    note_data = state.get('noteData', {}).get('data', {}).get('noteData', {})
+    if not note_data:
+        return [], '', ''
+
+    title = note_data.get('title', '')
+    description = note_data.get('desc', '')
+    image_list = note_data.get('imageList', [])
+
+    image_urls = []
+    for img in image_list:
+        # Prefer H5_DTL (1080px JPEG) from infoList, fall back to top-level url
+        url = ''
+        for entry in img.get('infoList', []):
+            if entry.get('imageScene') == 'H5_DTL':
+                url = entry.get('url', '')
+                break
+        if not url:
+            url = img.get('url', '') or img.get('urlDefault', '')
+        if url:
+            image_urls.append(url)
+
+    return image_urls, title, description
+
+
+def _fetch_mobile_page(url, browser='chrome'):
+    """Fetch a Xiaohongshu page with a mobile user-agent using yt-dlp's auth."""
+    import tempfile, urllib.request, http.cookiejar, time as _time
+
+    MAX_EXPIRY = int(_time.time()) + 10 * 365 * 86400
+
+    # Export browser cookies to a temp file
+    cookie_file = os.path.join(tempfile.gettempdir(), 'xhs_cookies.txt')
+    subprocess.run(
+        ["yt-dlp", "--cookies-from-browser", browser,
+         "--cookies", cookie_file, "--skip-download", "--quiet", url],
+        capture_output=True)
+
+    cj = http.cookiejar.MozillaCookieJar()
+    if os.path.exists(cookie_file):
+        try:
+            cj.load(cookie_file, ignore_discard=True, ignore_expires=True)
+        except Exception:
+            pass
+
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+    opener.addheaders = [
+        ('User-Agent', _MOBILE_UA),
+        ('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'),
+        ('Accept-Language', 'zh-CN,zh;q=0.9'),
+        ('Referer', 'https://www.xiaohongshu.com/'),
+    ]
+    try:
+        return opener.open(url, timeout=30).read().decode('utf-8', errors='ignore')
+    except Exception as e:
+        print(f"Warning: Mobile page fetch failed: {e}")
+        return ''
+
+
+def _download_image_urls(image_urls, output_dir):
+    """Download a list of image URLs into output_dir, named 01.jpg, 02.jpg, …"""
+    import urllib.request
+    downloaded = []
+    for i, img_url in enumerate(image_urls, 1):
+        # Determine extension: prefer explicit suffix in URL, default jpg
+        ext_match = re.search(r'!h5_\d+([a-z]+)$', img_url)
+        if ext_match:
+            ext = ext_match.group(1)
+        else:
+            ext_match2 = re.search(r'\.(jpe?g|png|webp|gif)(?:[?!@]|$)', img_url, re.IGNORECASE)
+            ext = ext_match2.group(1).lower() if ext_match2 else 'jpg'
+        dest = os.path.join(output_dir, f"{i:02d}.{ext}")
+        try:
+            req = urllib.request.Request(img_url, headers={
+                'User-Agent': _MOBILE_UA,
+                'Referer': 'https://www.xiaohongshu.com/',
+            })
+            with urllib.request.urlopen(req, timeout=30) as resp, open(dest, 'wb') as f:
+                f.write(resp.read())
+            size_kb = os.path.getsize(dest) / 1024
+            print(f"  {i:02d}.{ext:4s}  {size_kb:.1f} KB")
+            downloaded.append(dest)
+        except Exception as e:
+            print(f"  Warning: Failed to download image {i}: {e}")
+    return downloaded
+
+
 def download_image_post(url, info, output_path, browser="chrome"):
     """Download all images and text from a Xiaohongshu image post."""
-    title = info.get('title', 'untitled') if info else 'untitled'
+    url = _normalize_url(url)
+
+    # Extract post ID for page parsing
+    id_match = re.search(r'/explore/([0-9a-f]+)', url)
+    post_id = id_match.group(1) if id_match else 'unknown'
+
+    # Use info dict values if available; the fallback sentinel only has id as title
+    title = (info.get('title', '') if info else '') or post_id
     description = info.get('description', '') if info else ''
     uploader = info.get('uploader', 'Unknown') if info else 'Unknown'
 
@@ -119,26 +258,60 @@ def download_image_post(url, info, output_path, browser="chrome"):
     output_dir = os.path.join(output_path, safe_title)
     os.makedirs(output_dir, exist_ok=True)
 
-    print(f"Title: {title}")
+    print(f"Post ID: {post_id}")
     print(f"Uploader: {uploader}")
     print(f"Type: image post")
     print(f"Output: {output_dir}\n")
 
-    # Download images; omit --no-playlist so multi-image galleries are fully fetched
+    image_exts = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+
+    # --- Strategy 1: yt-dlp native (works if XHS extractor ever gains image support) ---
+    print("Image strategy 1/2: Trying yt-dlp native download...")
     cmd = ["yt-dlp"]
     if browser and browser != "none":
         cmd.extend(["--cookies-from-browser", browser])
-    cmd.extend([
-        "-o", os.path.join(output_dir, "%(autonumber)02d.%(ext)s"),
-    ])
+    cmd.extend(["-o", os.path.join(output_dir, "%(autonumber)02d.%(ext)s")])
     cmd.append(url)
+    subprocess.run(cmd, capture_output=True, text=True)
 
-    try:
-        subprocess.run(cmd, check=True)
-        print("\nImages downloaded!")
-    except subprocess.CalledProcessError as e:
-        print(f"\nError downloading images: {e}")
+    downloaded_images = sorted([
+        f for f in os.listdir(output_dir)
+        if os.path.splitext(f)[1].lower() in image_exts
+    ])
+
+    # --- Strategy 2: mobile-UA page fetch + JSON parse ---
+    if not downloaded_images:
+        print("yt-dlp native failed. Trying mobile-UA page parse...")
+        html = _fetch_mobile_page(url, browser) if browser and browser != "none" else ''
+        image_urls, scraped_title, scraped_desc = _parse_mobile_state(html)
+
+        if image_urls:
+            print(f"Found {len(image_urls)} image(s). Downloading...")
+            _download_image_urls(image_urls, output_dir)
+
+        if scraped_title and scraped_title != post_id:
+            title = scraped_title
+            new_safe = sanitize_title(title)
+            new_dir = os.path.join(output_path, new_safe)
+            if new_dir != output_dir and not os.path.exists(new_dir):
+                os.rename(output_dir, new_dir)
+                output_dir = new_dir
+        if scraped_desc:
+            description = scraped_desc
+
+        downloaded_images = sorted([
+            f for f in os.listdir(output_dir)
+            if os.path.splitext(f)[1].lower() in image_exts
+        ])
+
+    if not downloaded_images:
+        print("\nError: Could not download images.")
+        print("Tips:")
+        print("  1. Make sure you are logged into xiaohongshu.com in Chrome")
+        print("  2. Try opening the URL in your browser first, then retry")
         return False
+
+    print(f"\nDownloaded {len(downloaded_images)} image(s).")
 
     # Save title + description to post.txt
     text_path = os.path.join(output_dir, "post.txt")
@@ -149,15 +322,11 @@ def download_image_post(url, info, output_path, browser="chrome"):
     print(f"Text saved: {text_path}")
 
     # Print summary
-    image_exts = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
-    images = sorted([
-        fname for fname in os.listdir(output_dir)
-        if os.path.splitext(fname)[1].lower() in image_exts
-    ])
     print(f"\n{'='*50}")
+    print(f"Title: {title}")
     print(f"Resource pack saved to: {output_dir}")
     print(f"{'='*50}")
-    for img in images:
+    for img in downloaded_images:
         size_kb = os.path.getsize(os.path.join(output_dir, img)) / 1024
         print(f"  {img:20s} {size_kb:>8.1f} KB")
     print(f"  {'post.txt':20s} (title + description)")
@@ -374,6 +543,8 @@ def download_video(url, output_path=None, quality="best", browser="chrome",
 
     if output_path is None:
         output_path = os.path.expanduser("~/Downloads")
+
+    url = _normalize_url(url)
 
     # Get post info first
     info = get_video_info(url, browser)
