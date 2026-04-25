@@ -1,12 +1,16 @@
 ---
 name: xiaohongshu-downloader
-description: Download and summarize Xiaohongshu (小红书/RedNote) posts — both videos and image posts. Produces a full resource pack with optional AI summary. This skill should be used when the user asks to "download xiaohongshu video", "下载小红书视频", "下载小红书图文", "总结小红书", "save rednote post", "download from xiaohongshu", "小红书视频下载", "总结小红书视频", "summarize xiaohongshu", or mentions downloading/summarizing content from xiaohongshu.com or xhslink.com.
-version: 2.3.0
+description: Download and summarize Xiaohongshu (小红书/RedNote) posts — both videos and image posts. Produces a full resource pack with AI summary for image posts. This skill should be used when the user asks to "download xiaohongshu video", "下载小红书视频", "下载小红书图文", "总结小红书", "save rednote post", "download from xiaohongshu", "小红书视频下载", "总结小红书视频", "summarize xiaohongshu", or mentions downloading/summarizing content from xiaohongshu.com or xhslink.com.
+version: 2.6.0
 ---
 
 # Xiaohongshu Downloader & Summarizer
 
 Download posts from Xiaohongshu (小红书/RedNote). The script **automatically detects** whether the URL is a video post or an image post and handles each accordingly.
+
+**Default behavior (no flags needed):**
+- **Video post** → full resource pack: video + audio + subtitles + transcript
+- **Image post** → all images + post.txt + `.meta.json`, then Claude generates `summary.md`
 
 ## Workflow
 
@@ -23,61 +27,38 @@ Both must be available. If missing:
 - `brew install yt-dlp` (macOS) or `pip install yt-dlp`
 - `brew install ffmpeg` (macOS)
 
-### Step 2: Get Post Information
+### Step 2: Download
 
-```bash
-python3 scripts/download_xiaohongshu.py "URL" --list-formats
-```
-
-This shows available formats and verifies the URL works with cookie authentication.
-
-### Step 3: Download
-
-The script auto-detects the post type. Use the same commands for both video and image posts:
-
-For **basic download**:
+The script auto-detects the post type. Use the same command for both video and image posts:
 
 ```bash
 python3 scripts/download_xiaohongshu.py "URL" -o content/
 ```
 
-For **full resource pack** (video posts: + audio + subtitles + transcript; image posts: all images + text):
-
-```bash
-python3 scripts/download_xiaohongshu.py "URL" --full -o content/
-```
-
-For **full resource pack + AI summary** (both video and image posts):
-
-```bash
-python3 scripts/download_xiaohongshu.py "URL" --summary -o content/
-```
-
-**Video post** — `--full` creates `content/<title>/` with:
+**Video post** — creates `content/<title>/` with:
 - `video.mp4` — original video
 - `audio.mp3` — extracted audio
 - `subtitle.vtt` — WebVTT subtitles (via 3-tier strategy)
 - `transcript.txt` — plain text transcription
 
-**Image post** — always creates `content/<title>/` with:
+**Image post** — creates `content/<title>/` with:
 - `01.jpg`, `02.jpg`, … — all images in the post
 - `post.txt` — post title and description text
+- `.meta.json` — metadata for Claude to generate summary
 
-When `--summary` is used on an image post, `.meta.json` is also saved and Claude will read the images to generate `summary.md`.
-
-### Step 4: Subtitle Acquisition — Video Posts Only (Automatic 3-Tier Strategy)
+### Step 3: Subtitle Acquisition — Video Posts Only (Automatic 3-Tier Strategy)
 
 1. **Manual subtitles** — `yt-dlp --write-subs --sub-lang zh,en,zh-Hans,zh-CN`
 2. **Auto-generated subtitles** — `yt-dlp --write-auto-subs`
 3. **Whisper local transcription** — Falls back to `parallel_transcribe.py` using faster-whisper
 
-### Step 5: Generate Transcript — Video Posts Only (Automatic)
+### Step 4: Generate Transcript — Video Posts Only (Automatic)
 
 The script automatically strips timestamps from VTT to produce `transcript.txt`.
 
-### Step 6: AI Summary — Video Posts (Claude generates summary.md from transcript)
+### Step 5: AI Summary — Video Posts (always generate after download)
 
-If the user requested a summary on a **video post** (via `--summary` or by asking to "summarize"):
+After every video post download, Claude must generate `summary.md` from the transcript.
 
 1. Read the transcript file:
    ```
@@ -108,9 +89,9 @@ If the user requested a summary on a **video post** (via `--summary` or by askin
    content/<video title>/summary.md
    ```
 
-### Step 7: AI Summary — Image Posts (Claude reads images to generate summary.md)
+### Step 6: AI Summary — Image Posts (always generate after download)
 
-If the user requested a summary on an **image post** (via `--summary` or by asking to "summarize"):
+After every image post download, Claude must generate `summary.md` by reading the images.
 
 1. Read the instructions template:
    ```
@@ -151,46 +132,48 @@ If the user requested a summary on an **image post** (via `--summary` or by aski
 | `--browser` | Browser for cookies (`chrome`, `firefox`, `safari`, `none`) | `chrome` |
 | `-a, --audio-only` | Download audio only as MP3 | `false` |
 | `--list-formats` | List available formats | `false` |
-| `--full` | Full resource pack mode | `false` |
-| `--summary` | AI summary mode (implies `--full`) | `false` |
+| `--full` | Full resource pack mode | `true` (default) |
+| `--summary` | Save `.meta.json` for Claude to generate summary.md | `true` (default) |
+
+## Batch Download
+
+Use `download_list.md` to queue multiple URLs and download them in one run. Each line is a URL; lines starting with `#` are skipped. After a successful download, the script automatically prefixes the line with `# [done] `.
+
+```bash
+python3 scripts/download_xiaohongshu.py --batch download_list.md -o content/
+```
+
+Example `download_list.md`:
+```
+https://www.xiaohongshu.com/explore/abc123
+https://www.xiaohongshu.com/explore/def456
+# [done] https://www.xiaohongshu.com/explore/ghi789
+```
+
+The batch command respects all the same defaults: full resource pack for videos, images + summary for image posts.
 
 ## Output Structure
 
-### Video post — basic mode
-```
-content/
-└── <title> [<id>].mp4
-```
-
-### Video post — full resource pack (`--full` or `--summary`)
+### Video post
 ```
 content/<video title>/
 ├── video.mp4          # Original video
 ├── audio.mp3          # Extracted audio
 ├── subtitle.vtt       # WebVTT subtitles
 ├── transcript.txt     # Plain text transcript
-├── .meta.json         # Video metadata (--summary only)
-└── summary.md         # AI-generated summary (--summary only, written by Claude)
+├── .meta.json         # Metadata for summary generation
+└── summary.md         # AI-generated summary (always generated by Claude)
 ```
 
-### Image post — basic / `--full`
+### Image post
 ```
 content/<post title>/
 ├── 01.jpg             # First image
 ├── 02.jpg             # Second image
 ├── ...
-└── post.txt           # Post title + description
-```
-
-### Image post — `--summary`
-```
-content/<post title>/
-├── 01.jpg
-├── 02.jpg
-├── ...
 ├── post.txt           # Post title + description
 ├── .meta.json         # Metadata for summary generation
-└── summary.md         # AI-generated summary (written by Claude after reading images)
+└── summary.md         # AI-generated summary (always generated by Claude)
 ```
 
 ## Supported URL Formats

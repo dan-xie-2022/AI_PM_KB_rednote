@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Xiaohongshu (小红书/RedNote) Downloader v2.1
+Xiaohongshu (小红书/RedNote) Downloader v2.6
 Supports both video posts and image posts.
-- Video post: downloads video + optional audio/subtitles/transcript/AI summary
-- Image post: downloads all images + saves title and description as post.txt
+- Video post: always downloads full resource pack (video + audio + subtitles + transcript)
+- Image post: always downloads all images + post.txt + generates .meta.json for AI summary
 """
 
 import argparse
@@ -13,7 +13,6 @@ import json
 import re
 import os
 import glob as globmod
-from pathlib import Path
 
 
 def check_yt_dlp():
@@ -84,6 +83,7 @@ def get_video_info(url, browser="chrome"):
             if post_type == 'normal' and image_urls:
                 return {
                     '_is_image_post': True,
+                    '_image_urls': image_urls,
                     'title': scraped_title or post_id,
                     'uploader': 'Unknown',
                     'description': scraped_desc,
@@ -191,9 +191,7 @@ def _parse_mobile_state(html):
 
 def _fetch_mobile_page(url, browser='chrome'):
     """Fetch a Xiaohongshu page with a mobile user-agent using yt-dlp's auth."""
-    import tempfile, urllib.request, http.cookiejar, time as _time
-
-    MAX_EXPIRY = int(_time.time()) + 10 * 365 * 86400
+    import tempfile, urllib.request, http.cookiejar
 
     # Export browser cookies to a temp file
     cookie_file = os.path.join(tempfile.gettempdir(), 'xhs_cookies.txt')
@@ -296,15 +294,13 @@ def _download_image_urls(image_urls, output_dir):
     return downloaded
 
 
-def download_image_post(url, info, output_path, browser="chrome", summary_mode=False):
+def download_image_post(url, info, output_path, browser="chrome", summary_mode=True):
     """Download all images and text from a Xiaohongshu image post."""
     url = _normalize_url(url)
 
-    # Extract post ID for page parsing
     id_match = re.search(r'/explore/([0-9a-f]+)', url)
     post_id = id_match.group(1) if id_match else 'unknown'
 
-    # Use info dict values if available; the fallback sentinel only has id as title
     title = (info.get('title', '') if info else '') or post_id
     description = info.get('description', '') if info else ''
     uploader = info.get('uploader', 'Unknown') if info else 'Unknown'
@@ -320,24 +316,15 @@ def download_image_post(url, info, output_path, browser="chrome", summary_mode=F
 
     image_exts = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
 
-    # --- Strategy 1: yt-dlp native (works if XHS extractor ever gains image support) ---
-    print("Image strategy 1/2: Trying yt-dlp native download...")
-    pre_existing = set(os.listdir(output_dir))
-    cmd = ["yt-dlp"]
-    if browser and browser != "none":
-        cmd.extend(["--cookies-from-browser", browser])
-    cmd.extend(["-o", os.path.join(output_dir, "%(autonumber)02d.%(ext)s")])
-    cmd.append(url)
-    subprocess.run(cmd, capture_output=True, text=True)
+    # Use pre-fetched image URLs from get_video_info if available (avoids redundant request)
+    prefetched_urls = (info or {}).get('_image_urls', [])
 
-    downloaded_images = sorted([
-        f for f in os.listdir(output_dir)
-        if os.path.splitext(f)[1].lower() in image_exts and f not in pre_existing
-    ])
-
-    # --- Strategy 2: mobile-UA page fetch + JSON parse ---
-    if not downloaded_images:
-        print("yt-dlp native failed. Trying mobile-UA page parse...")
+    if prefetched_urls:
+        print(f"Downloading {len(prefetched_urls)} image(s)...")
+        _download_image_urls(prefetched_urls, output_dir)
+    else:
+        # Fallback: fetch mobile page to get image URLs
+        print("Fetching image URLs from mobile page...")
         html = _fetch_mobile_page(url, browser) if browser and browser != "none" else ''
         _, image_urls, scraped_title, scraped_desc = _parse_mobile_state(html)
 
@@ -354,8 +341,6 @@ def download_image_post(url, info, output_path, browser="chrome", summary_mode=F
                     os.rename(output_dir, new_dir)
                     output_dir = new_dir
                 else:
-                    # Target dir already exists (e.g. re-running --summary) —
-                    # move any new files in, then clean up the ID-named temp dir
                     for fname in os.listdir(output_dir):
                         src = os.path.join(output_dir, fname)
                         dst = os.path.join(new_dir, fname)
@@ -369,10 +354,10 @@ def download_image_post(url, info, output_path, browser="chrome", summary_mode=F
         if scraped_desc:
             description = scraped_desc
 
-        downloaded_images = sorted([
-            f for f in os.listdir(output_dir)
-            if os.path.splitext(f)[1].lower() in image_exts
-        ])
+    downloaded_images = sorted([
+        f for f in os.listdir(output_dir)
+        if os.path.splitext(f)[1].lower() in image_exts
+    ])
 
     if not downloaded_images:
         print("\nError: Could not download images.")
@@ -649,12 +634,13 @@ def download_video(url, output_path=None, quality="best", browser="chrome",
     post_type = detect_post_type(info)
     if post_type == 'image':
         print("Detected: image post (no video stream)\n")
-        if full_mode and not summary_mode:
-            print("Note: --full is not applicable to image posts (images are always downloaded).\n")
-        return download_image_post(url, info, output_path, browser, summary_mode=summary_mode)
+        return download_image_post(url, info, output_path, browser, summary_mode=True)
 
     # If yt-dlp couldn't extract info (info is None), try direct mobile video download
+    video_path = None
+
     if info is None:
+        # yt-dlp failed — fall back to direct mobile video download
         print("yt-dlp extraction failed. Trying direct mobile video download...")
         html = _fetch_mobile_page(url, browser) if browser and browser != "none" else ''
         video_url, mobile_title, mobile_desc = _extract_video_url_from_mobile(html)
@@ -663,13 +649,9 @@ def download_video(url, output_path=None, quality="best", browser="chrome",
             return False
         title = mobile_title or title
         safe_title = sanitize_title(title)
-        if full_mode:
-            output_dir = os.path.join(output_path, safe_title)
-            os.makedirs(output_dir, exist_ok=True)
-            dest_path = os.path.join(output_dir, "video.mp4")
-        else:
-            output_dir = output_path
-            dest_path = os.path.join(output_path, f"{safe_title}.mp4")
+        output_dir = os.path.join(output_path, safe_title)
+        os.makedirs(output_dir, exist_ok=True)
+        dest_path = os.path.join(output_dir, "video.mp4")
         print(f"Title: {title}")
         print(f"Downloading video directly: {video_url[:80]}...")
         import urllib.request
@@ -679,29 +661,20 @@ def download_video(url, output_path=None, quality="best", browser="chrome",
         })
         try:
             with urllib.request.urlopen(req, timeout=120) as resp, open(dest_path, 'wb') as f:
-                size = 0
                 while True:
                     chunk = resp.read(1024 * 64)
                     if not chunk:
                         break
                     f.write(chunk)
-                    size += len(chunk)
             size_mb = os.path.getsize(dest_path) / (1024 * 1024)
             print(f"Downloaded: {dest_path} ({size_mb:.1f} MB)")
         except Exception as e:
             print(f"Error downloading video: {e}")
             return False
-        if full_mode:
-            print(f"\n{'='*50}")
-            print(f"Title: {title}")
-            print(f"Resource pack saved to: {output_dir}")
-            print(f"{'='*50}")
-            print(f"  video.mp4  ({size_mb:.1f} MB)")
-            print("Note: Audio/subtitle extraction skipped (direct download mode).")
-        return True
+        video_path = dest_path
 
-    # --- Video post (yt-dlp succeeded) ---
-    if info:
+    else:
+        # --- Video post (yt-dlp succeeded) ---
         if duration:
             print(f"Title: {title}")
             print(f"Duration: {duration // 60}:{duration % 60:02d}")
@@ -710,96 +683,90 @@ def download_video(url, output_path=None, quality="best", browser="chrome",
             print(f"Title: {title}")
             print(f"Uploader: {uploader}\n")
 
-    # Determine output directory
-    if full_mode:
-        safe_title = sanitize_title(title)
-        output_dir = os.path.join(output_path, safe_title)
-        os.makedirs(output_dir, exist_ok=True)
-        video_output = os.path.join(output_dir, "video.%(ext)s")
-    else:
-        output_dir = output_path
-        video_output = os.path.join(output_path, "%(title)s [%(id)s].%(ext)s")
-
-    # Build yt-dlp command
-    cmd = ["yt-dlp"]
-
-    if browser and browser != "none":
-        cmd.extend(["--cookies-from-browser", browser])
-
-    if audio_only:
-        cmd.extend([
-            "-x",
-            "--audio-format", "mp3",
-            "--audio-quality", "0",
-        ])
-    else:
-        if quality == "best":
-            format_string = "bestvideo+bestaudio/best"
+        # Determine output directory
+        if full_mode:
+            safe_title = sanitize_title(title)
+            output_dir = os.path.join(output_path, safe_title)
+            os.makedirs(output_dir, exist_ok=True)
+            video_output = os.path.join(output_dir, "video.%(ext)s")
         else:
-            height = quality.replace("p", "")
-            format_string = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
+            output_dir = output_path
+            video_output = os.path.join(output_path, "%(title)s [%(id)s].%(ext)s")
+
+        # Build yt-dlp command
+        cmd = ["yt-dlp"]
+
+        if browser and browser != "none":
+            cmd.extend(["--cookies-from-browser", browser])
+
+        if audio_only:
+            cmd.extend([
+                "-x",
+                "--audio-format", "mp3",
+                "--audio-quality", "0",
+            ])
+        else:
+            if quality == "best":
+                format_string = "bestvideo+bestaudio/best"
+            else:
+                height = quality.replace("p", "")
+                format_string = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
+
+            cmd.extend([
+                "-f", format_string,
+                "--merge-output-format", "mp4",
+            ])
 
         cmd.extend([
-            "-f", format_string,
-            "--merge-output-format", "mp4",
+            "-o", video_output,
+            "--no-playlist",
         ])
+        cmd.append(url)
 
-    cmd.extend([
-        "-o", video_output,
-        "--no-playlist",
-    ])
-    cmd.append(url)
+        print(f"URL: {url}")
+        print(f"Quality: {quality}")
+        print(f"Format: {'mp3 (audio only)' if audio_only else 'mp4'}")
+        print(f"Mode: {'full resource pack' if full_mode else 'video only'}")
+        print(f"Cookies: from {browser}" if browser != "none" else "Cookies: none")
+        print(f"Output: {output_dir}\n")
 
-    print(f"URL: {url}")
-    print(f"Quality: {quality}")
-    print(f"Format: {'mp3 (audio only)' if audio_only else 'mp4'}")
-    print(f"Mode: {'full resource pack' if full_mode else 'video only'}")
-    print(f"Cookies: from {browser}" if browser != "none" else "Cookies: none")
-    print(f"Output: {output_dir}\n")
+        try:
+            subprocess.run(cmd, check=True)
+            print(f"\nVideo download complete!")
+        except subprocess.CalledProcessError as e:
+            print(f"\nError downloading video: {e}")
+            print("\nTroubleshooting tips:")
+            print("1. Make sure you're logged into xiaohongshu.com in your browser")
+            print("2. Try copying a fresh share link (tokens expire)")
+            print("3. If CAPTCHA appears, open the URL in browser first")
+            return False
 
-    # Download video
-    try:
-        subprocess.run(cmd, check=True)
-        print(f"\nVideo download complete!")
-    except subprocess.CalledProcessError as e:
-        print(f"\nError downloading video: {e}")
-        print("\nTroubleshooting tips:")
-        print("1. Make sure you're logged into xiaohongshu.com in your browser")
-        print("2. Try copying a fresh share link (tokens expire)")
-        print("3. If CAPTCHA appears, open the URL in browser first")
-        return False
+        if not full_mode:
+            print(f"Saved to: {output_dir}")
+            return True
 
-    if not full_mode:
-        print(f"Saved to: {output_dir}")
-        return True
+        # Find the downloaded video file
+        for ext in ["mp4", "mkv", "webm"]:
+            candidate = os.path.join(output_dir, f"video.{ext}")
+            if os.path.exists(candidate):
+                video_path = candidate
+                break
 
-    # --- Full resource pack mode ---
-    # Find the downloaded video file
-    video_path = None
-    for ext in ["mp4", "mkv", "webm"]:
-        candidate = os.path.join(output_dir, f"video.{ext}")
-        if os.path.exists(candidate):
-            video_path = candidate
-            break
+        if not video_path:
+            print("Warning: Could not find downloaded video file for further processing.")
+            return True
 
-    if not video_path:
-        print("Warning: Could not find downloaded video file for further processing.")
-        return True
-
-    # Step: Extract audio
+    # --- Full resource pack pipeline (shared by both download paths) ---
     print("\n--- Extracting audio ---")
     audio_path = extract_audio(video_path, output_dir)
 
-    # Step: Get subtitles
     print("\n--- Acquiring subtitles ---")
     vtt_path = download_subtitles(url, output_dir, browser, audio_path)
 
-    # Step: Generate transcript from subtitles
     if vtt_path:
         print("\n--- Generating transcript ---")
         generate_transcript(vtt_path, output_dir)
 
-    # If summary mode requested, write metadata for Claude to use
     if summary_mode:
         meta_path = os.path.join(output_dir, ".meta.json")
         meta = {
@@ -814,7 +781,6 @@ def download_video(url, output_path=None, quality="best", browser="chrome",
         print(f"\nMetadata saved: {meta_path}")
         print("Summary mode enabled — Claude will generate summary.md using the transcript.")
 
-    # Print summary
     print(f"\n{'='*50}")
     print(f"Resource pack saved to: {output_dir}")
     print(f"{'='*50}")
@@ -941,11 +907,13 @@ def main():
     parser.add_argument(
         "--full",
         action="store_true",
+        default=True,
         help="Full resource pack: video + audio + subtitles + transcript"
     )
     parser.add_argument(
         "--summary",
         action="store_true",
+        default=True,
         help="Enable AI summary mode (saves metadata for Claude to generate summary.md)"
     )
 

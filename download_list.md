@@ -3,4 +3,3 @@
 # [done] https://www.rednote.com/explore/69c4de62000000002301c6f3?xsec_token=ABYgc00HVCO3ZWl_tgCvHyVn2CgKSosSYxDnxKh2oXnAw=&xsec_source=pc_collect
 # [done] https://www.rednote.com/explore/689abc860000000025019c06?xsec_token=ABZbdYZJD8ekqCLZrMSpk-p5MBhCLmfY1sLH-Ztb0szLE=&xsec_source=pc_collect
 # [done] https://www.rednote.com/explore/69ea037300000000230156c3?xsec_token=AB6ijFM_cI8ZaaWw1tgN9XUeSvn62e9qga4ZhmyKVh-58=&xsec_source=pc_like
-# [done] https://www.rednote.com/explore/69e2359100000000230061e1?xsec_token=ABTfk-QgjeqfK8gBnJtHHqnb94ymcdrPF4UFEpbNA7drk=&xsec_source=pc_like
