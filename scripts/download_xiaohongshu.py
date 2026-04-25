@@ -75,17 +75,21 @@ def get_video_info(url, browser="chrome"):
             print("Solution: Open the URL in your browser, solve the CAPTCHA, then retry.")
             return None
         elif "No video formats found" in stderr:
-            # Image post — yt-dlp found the page but no video; treat as image post
-            # Try to salvage any partial JSON from stdout
-            if e.stdout and e.stdout.strip():
-                try:
-                    return json.loads(e.stdout)
-                except json.JSONDecodeError:
-                    pass
-            # Extract post ID from URL as fallback title
+            # Could be an image post OR a video post yt-dlp can't extract.
+            # Verify by checking the mobile page type field.
+            html = _fetch_mobile_page(url, browser)
+            post_type, image_urls, scraped_title, scraped_desc = _parse_mobile_state(html)
             id_match = re.search(r'/explore/([0-9a-f]+)', url)
             post_id = id_match.group(1) if id_match else 'unknown'
-            return {'_is_image_post': True, 'title': post_id, 'uploader': 'Unknown', 'description': ''}
+            if post_type == 'normal' and image_urls:
+                return {
+                    '_is_image_post': True,
+                    'title': scraped_title or post_id,
+                    'uploader': 'Unknown',
+                    'description': scraped_desc,
+                }
+            # type == 'video' or unknown → yt-dlp failed on a video post
+            return None
         else:
             print(f"Error getting video info: {stderr}")
             return None
@@ -139,13 +143,14 @@ def _parse_mobile_state(html):
     """Parse window.__INITIAL_STATE__ from mobile-UA page response.
 
     XHS serves a different SSR payload for mobile UAs that includes the full
-    note data (imageList, title, desc) under state.noteData.data.noteData.
+    note data (type, imageList, title, desc) under state.noteData.data.noteData.
 
-    Returns (image_urls, title, description) or ([], '', '') on failure.
+    Returns (post_type, image_urls, title, description) or ('unknown', [], '', '') on failure.
+    post_type is 'video', 'normal' (image post), or 'unknown'.
     """
     idx = html.find('window.__INITIAL_STATE__')
     if idx == -1:
-        return [], '', ''
+        return 'unknown', [], '', ''
     raw = html[idx + len('window.__INITIAL_STATE__='):]
     end = raw.find('</script>')
     raw = raw[:end].rstrip('; \n\r')
@@ -153,12 +158,13 @@ def _parse_mobile_state(html):
     try:
         state = json.loads(raw)
     except json.JSONDecodeError:
-        return [], '', ''
+        return 'unknown', [], '', ''
 
     note_data = state.get('noteData', {}).get('data', {}).get('noteData', {})
     if not note_data:
-        return [], '', ''
+        return 'unknown', [], '', ''
 
+    post_type = note_data.get('type', 'unknown')  # 'video' or 'normal'
     title = note_data.get('title', '')
     description = note_data.get('desc', '')
     image_list = note_data.get('imageList', [])
@@ -176,7 +182,11 @@ def _parse_mobile_state(html):
         if url:
             image_urls.append(url)
 
-    return image_urls, title, description
+    # For image posts, exclude the single cover image that also appears on video posts
+    if post_type == 'video':
+        image_urls = []
+
+    return post_type, image_urls, title, description
 
 
 def _fetch_mobile_page(url, browser='chrome'):
@@ -211,6 +221,51 @@ def _fetch_mobile_page(url, browser='chrome'):
     except Exception as e:
         print(f"Warning: Mobile page fetch failed: {e}")
         return ''
+
+
+def _extract_video_url_from_mobile(html):
+    """Extract best video stream URL and metadata from mobile page state.
+
+    Returns (video_url, title, description) or (None, '', '') on failure.
+    Prefers h264 for compatibility; picks highest-height stream.
+    """
+    idx = html.find('window.__INITIAL_STATE__')
+    if idx == -1:
+        return None, '', ''
+    raw = html[idx + len('window.__INITIAL_STATE__='):]
+    raw = raw[:raw.find('</script>')].rstrip('; \n\r')
+    raw = re.sub(r':\s*undefined\b', ': null', raw)
+    try:
+        state = json.loads(raw)
+    except json.JSONDecodeError:
+        return None, '', ''
+
+    note_data = state.get('noteData', {}).get('data', {}).get('noteData', {})
+    if not note_data:
+        return None, '', ''
+
+    description = note_data.get('desc', '')
+    raw_title = note_data.get('title', '').strip()
+    if not raw_title:
+        # Use first non-empty, non-hashtag line of desc as fallback title
+        for line in description.splitlines():
+            line = line.strip()
+            if line and not line.startswith('#'):
+                raw_title = line
+                break
+    title = raw_title
+    streams = note_data.get('video', {}).get('media', {}).get('stream', {})
+
+    # Prefer h264 (widest compatibility), fall back to h265
+    for codec in ('h264', 'h265', 'av1'):
+        entries = streams.get(codec, [])
+        if entries:
+            best = max(entries, key=lambda s: s.get('height', 0))
+            url = best.get('masterUrl', '')
+            if url:
+                return url, title, description
+
+    return None, title, description
 
 
 def _download_image_urls(image_urls, output_dir):
@@ -284,7 +339,7 @@ def download_image_post(url, info, output_path, browser="chrome", summary_mode=F
     if not downloaded_images:
         print("yt-dlp native failed. Trying mobile-UA page parse...")
         html = _fetch_mobile_page(url, browser) if browser and browser != "none" else ''
-        image_urls, scraped_title, scraped_desc = _parse_mobile_state(html)
+        _, image_urls, scraped_title, scraped_desc = _parse_mobile_state(html)
 
         if image_urls:
             print(f"Found {len(image_urls)} image(s). Downloading...")
@@ -598,7 +653,54 @@ def download_video(url, output_path=None, quality="best", browser="chrome",
             print("Note: --full is not applicable to image posts (images are always downloaded).\n")
         return download_image_post(url, info, output_path, browser, summary_mode=summary_mode)
 
-    # --- Video post ---
+    # If yt-dlp couldn't extract info (info is None), try direct mobile video download
+    if info is None:
+        print("yt-dlp extraction failed. Trying direct mobile video download...")
+        html = _fetch_mobile_page(url, browser) if browser and browser != "none" else ''
+        video_url, mobile_title, mobile_desc = _extract_video_url_from_mobile(html)
+        if not video_url:
+            print("Error: Could not extract video URL from mobile page.")
+            return False
+        title = mobile_title or title
+        safe_title = sanitize_title(title)
+        if full_mode:
+            output_dir = os.path.join(output_path, safe_title)
+            os.makedirs(output_dir, exist_ok=True)
+            dest_path = os.path.join(output_dir, "video.mp4")
+        else:
+            output_dir = output_path
+            dest_path = os.path.join(output_path, f"{safe_title}.mp4")
+        print(f"Title: {title}")
+        print(f"Downloading video directly: {video_url[:80]}...")
+        import urllib.request
+        req = urllib.request.Request(video_url, headers={
+            'User-Agent': _MOBILE_UA,
+            'Referer': 'https://www.xiaohongshu.com/',
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp, open(dest_path, 'wb') as f:
+                size = 0
+                while True:
+                    chunk = resp.read(1024 * 64)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    size += len(chunk)
+            size_mb = os.path.getsize(dest_path) / (1024 * 1024)
+            print(f"Downloaded: {dest_path} ({size_mb:.1f} MB)")
+        except Exception as e:
+            print(f"Error downloading video: {e}")
+            return False
+        if full_mode:
+            print(f"\n{'='*50}")
+            print(f"Title: {title}")
+            print(f"Resource pack saved to: {output_dir}")
+            print(f"{'='*50}")
+            print(f"  video.mp4  ({size_mb:.1f} MB)")
+            print("Note: Audio/subtitle extraction skipped (direct download mode).")
+        return True
+
+    # --- Video post (yt-dlp succeeded) ---
     if info:
         if duration:
             print(f"Title: {title}")
