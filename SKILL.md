@@ -1,7 +1,7 @@
 ---
 name: xiaohongshu-downloader
-description: Download and summarize Xiaohongshu (小红书/RedNote) posts — both videos and image posts. Produces a full resource pack. This skill should be used when the user asks to "download xiaohongshu video", "下载小红书视频", "下载小红书图文", "save rednote post", "download from xiaohongshu", "小红书视频下载", "总结小红书视频", "summarize xiaohongshu video", or mentions downloading/summarizing content from xiaohongshu.com or xhslink.com.
-version: 2.1.0
+description: Download and summarize Xiaohongshu (小红书/RedNote) posts — both videos and image posts. Produces a full resource pack with optional AI summary. This skill should be used when the user asks to "download xiaohongshu video", "下载小红书视频", "下载小红书图文", "总结小红书", "save rednote post", "download from xiaohongshu", "小红书视频下载", "总结小红书视频", "summarize xiaohongshu", or mentions downloading/summarizing content from xiaohongshu.com or xhslink.com.
+version: 2.3.0
 ---
 
 # Xiaohongshu Downloader & Summarizer
@@ -47,7 +47,7 @@ For **full resource pack** (video posts: + audio + subtitles + transcript; image
 python3 scripts/download_xiaohongshu.py "URL" --full -o content/
 ```
 
-For **full resource pack + AI summary** (video posts only):
+For **full resource pack + AI summary** (both video and image posts):
 
 ```bash
 python3 scripts/download_xiaohongshu.py "URL" --summary -o content/
@@ -63,7 +63,7 @@ python3 scripts/download_xiaohongshu.py "URL" --summary -o content/
 - `01.jpg`, `02.jpg`, … — all images in the post
 - `post.txt` — post title and description text
 
-The `--summary` flag is ignored for image posts. For image posts, `--full` and the basic command produce the same result.
+When `--summary` is used on an image post, `.meta.json` is also saved and Claude will read the images to generate `summary.md`.
 
 ### Step 4: Subtitle Acquisition — Video Posts Only (Automatic 3-Tier Strategy)
 
@@ -75,9 +75,9 @@ The `--summary` flag is ignored for image posts. For image posts, `--full` and t
 
 The script automatically strips timestamps from VTT to produce `transcript.txt`.
 
-### Step 6: AI Summary — Video Posts Only (Claude generates summary.md)
+### Step 6: AI Summary — Video Posts (Claude generates summary.md from transcript)
 
-If the user requested a summary (via `--summary` flag or by asking to "summarize"):
+If the user requested a summary on a **video post** (via `--summary` or by asking to "summarize"):
 
 1. Read the transcript file:
    ```
@@ -106,6 +106,40 @@ If the user requested a summary (via `--summary` flag or by asking to "summarize
 6. Save the result to:
    ```
    content/<video title>/summary.md
+   ```
+
+### Step 7: AI Summary — Image Posts (Claude reads images to generate summary.md)
+
+If the user requested a summary on an **image post** (via `--summary` or by asking to "summarize"):
+
+1. Read the instructions template:
+   ```
+   reference/image-summary-prompt.md
+   ```
+
+2. Read the metadata file:
+   ```
+   content/<post title>/.meta.json
+   ```
+
+3. Read `post.txt`:
+   ```
+   content/<post title>/post.txt
+   ```
+
+4. Read **every image** in the directory using the Read tool:
+   ```
+   content/<post title>/01.jpg
+   content/<post title>/02.jpg
+   … (all images listed in .meta.json → image_files)
+   ```
+   For each image, extract all visible text and identify what the slide is communicating.
+
+5. Generate the summary following the output format in `reference/image-summary-prompt.md`.
+
+6. Save the result to:
+   ```
+   content/<post title>/summary.md
    ```
 
 ## Options Reference
@@ -139,13 +173,24 @@ content/<video title>/
 └── summary.md         # AI-generated summary (--summary only, written by Claude)
 ```
 
-### Image post — all modes
+### Image post — basic / `--full`
 ```
 content/<post title>/
 ├── 01.jpg             # First image
 ├── 02.jpg             # Second image
 ├── ...
 └── post.txt           # Post title + description
+```
+
+### Image post — `--summary`
+```
+content/<post title>/
+├── 01.jpg
+├── 02.jpg
+├── ...
+├── post.txt           # Post title + description
+├── .meta.json         # Metadata for summary generation
+└── summary.md         # AI-generated summary (written by Claude after reading images)
 ```
 
 ## Supported URL Formats

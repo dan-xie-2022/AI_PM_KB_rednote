@@ -241,7 +241,7 @@ def _download_image_urls(image_urls, output_dir):
     return downloaded
 
 
-def download_image_post(url, info, output_path, browser="chrome"):
+def download_image_post(url, info, output_path, browser="chrome", summary_mode=False):
     """Download all images and text from a Xiaohongshu image post."""
     url = _normalize_url(url)
 
@@ -267,6 +267,7 @@ def download_image_post(url, info, output_path, browser="chrome"):
 
     # --- Strategy 1: yt-dlp native (works if XHS extractor ever gains image support) ---
     print("Image strategy 1/2: Trying yt-dlp native download...")
+    pre_existing = set(os.listdir(output_dir))
     cmd = ["yt-dlp"]
     if browser and browser != "none":
         cmd.extend(["--cookies-from-browser", browser])
@@ -276,7 +277,7 @@ def download_image_post(url, info, output_path, browser="chrome"):
 
     downloaded_images = sorted([
         f for f in os.listdir(output_dir)
-        if os.path.splitext(f)[1].lower() in image_exts
+        if os.path.splitext(f)[1].lower() in image_exts and f not in pre_existing
     ])
 
     # --- Strategy 2: mobile-UA page fetch + JSON parse ---
@@ -293,9 +294,23 @@ def download_image_post(url, info, output_path, browser="chrome"):
             title = scraped_title
             new_safe = sanitize_title(title)
             new_dir = os.path.join(output_path, new_safe)
-            if new_dir != output_dir and not os.path.exists(new_dir):
-                os.rename(output_dir, new_dir)
-                output_dir = new_dir
+            if new_dir != output_dir:
+                if not os.path.exists(new_dir):
+                    os.rename(output_dir, new_dir)
+                    output_dir = new_dir
+                else:
+                    # Target dir already exists (e.g. re-running --summary) —
+                    # move any new files in, then clean up the ID-named temp dir
+                    for fname in os.listdir(output_dir):
+                        src = os.path.join(output_dir, fname)
+                        dst = os.path.join(new_dir, fname)
+                        if not os.path.exists(dst):
+                            os.rename(src, dst)
+                    try:
+                        os.rmdir(output_dir)
+                    except OSError:
+                        pass
+                    output_dir = new_dir
         if scraped_desc:
             description = scraped_desc
 
@@ -321,6 +336,23 @@ def download_image_post(url, info, output_path, browser="chrome"):
             f.write(f"\n{description}\n")
     print(f"Text saved: {text_path}")
 
+    # Save metadata for Claude to use when generating summary
+    if summary_mode:
+        meta_path = os.path.join(output_dir, ".meta.json")
+        meta = {
+            "title": title,
+            "url": url,
+            "platform": "Xiaohongshu (小红书)",
+            "uploader": uploader,
+            "post_type": "image",
+            "image_count": len(downloaded_images),
+            "image_files": downloaded_images,
+        }
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        print(f"Metadata saved: {meta_path}")
+        print("Summary mode enabled — Claude will generate summary.md by reading the images.")
+
     # Print summary
     print(f"\n{'='*50}")
     print(f"Title: {title}")
@@ -330,6 +362,8 @@ def download_image_post(url, info, output_path, browser="chrome"):
         size_kb = os.path.getsize(os.path.join(output_dir, img)) / 1024
         print(f"  {img:20s} {size_kb:>8.1f} KB")
     print(f"  {'post.txt':20s} (title + description)")
+    if summary_mode:
+        print(f"  {'.meta.json':20s} (metadata for summary)")
 
     return True
 
@@ -560,9 +594,9 @@ def download_video(url, output_path=None, quality="best", browser="chrome",
     post_type = detect_post_type(info)
     if post_type == 'image':
         print("Detected: image post (no video stream)\n")
-        if full_mode or summary_mode:
-            print("Note: --full and --summary are not applicable to image posts, ignored.\n")
-        return download_image_post(url, info, output_path, browser)
+        if full_mode and not summary_mode:
+            print("Note: --full is not applicable to image posts (images are always downloaded).\n")
+        return download_image_post(url, info, output_path, browser, summary_mode=summary_mode)
 
     # --- Video post ---
     if info:
@@ -693,11 +727,88 @@ def download_video(url, output_path=None, quality="best", browser="chrome",
     return True
 
 
+def _read_batch_file(filepath):
+    """Return list of (line_index, url) for all pending (non-done, non-blank, non-comment) lines."""
+    with open(filepath, encoding='utf-8') as f:
+        lines = f.readlines()
+    pending = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        url = stripped.split()[0]
+        pending.append((i, url))
+    return pending
+
+
+def _mark_done(filepath, line_index):
+    """Prefix a line in the batch file with '# [done] ' to skip it on future runs."""
+    with open(filepath, encoding='utf-8') as f:
+        lines = f.readlines()
+    lines[line_index] = '# [done] ' + lines[line_index]
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.writelines(lines)
+
+
+def batch_download(filepath, output_path, quality, browser, audio_only, full_mode, summary_mode):
+    """Download all pending URLs in a batch file, marking each done after success."""
+    if not os.path.exists(filepath):
+        print(f"Error: batch file not found: {filepath}")
+        return False
+
+    pending = _read_batch_file(filepath)
+    if not pending:
+        print("No pending URLs found in batch file.")
+        return True
+
+    print(f"Found {len(pending)} pending URL(s) in {filepath}\n")
+
+    results = []
+    for i, (line_idx, url) in enumerate(pending, 1):
+        print(f"{'='*60}")
+        print(f"[{i}/{len(pending)}] {url}")
+        print(f"{'='*60}")
+        try:
+            success = download_video(
+                url=url,
+                output_path=output_path,
+                quality=quality,
+                browser=browser,
+                audio_only=audio_only,
+                full_mode=full_mode,
+                summary_mode=summary_mode,
+            )
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            success = False
+
+        results.append((url, success))
+        if success:
+            _mark_done(filepath, line_idx)
+            print(f"\n[done] Marked as complete in batch file.\n")
+        else:
+            print(f"\n[failed] URL kept in batch file for retry.\n")
+
+    print(f"{'='*60}")
+    print(f"Batch complete: {sum(s for _, s in results)}/{len(results)} succeeded")
+    failed = [u for u, s in results if not s]
+    if failed:
+        print("Failed URLs (still in batch file):")
+        for u in failed:
+            print(f"  {u}")
+    return all(s for _, s in results)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Download Xiaohongshu (小红书) videos using yt-dlp"
     )
-    parser.add_argument("url", help="Xiaohongshu video URL (explore, discovery, or xhslink.com)")
+    parser.add_argument("url", nargs='?', help="Xiaohongshu video URL (explore, discovery, or xhslink.com)")
+    parser.add_argument(
+        "--batch",
+        metavar="FILE",
+        help="Batch download: read URLs from FILE, mark each done after success"
+    )
     parser.add_argument(
         "-o", "--output",
         default=None,
@@ -738,7 +849,27 @@ def main():
 
     args = parser.parse_args()
 
-    # Validate URL
+    if not args.url and not args.batch:
+        parser.error("provide a URL or --batch FILE")
+
+    # --summary implies --full
+    if args.summary:
+        args.full = True
+
+    # Batch mode
+    if args.batch:
+        success = batch_download(
+            filepath=args.batch,
+            output_path=args.output,
+            quality=args.quality,
+            browser=args.browser,
+            audio_only=args.audio_only,
+            full_mode=args.full,
+            summary_mode=args.summary,
+        )
+        sys.exit(0 if success else 1)
+
+    # Single URL mode
     if not validate_url(args.url):
         print("Warning: URL does not match known Xiaohongshu patterns.")
         print("Supported formats:")
@@ -750,10 +881,6 @@ def main():
     if args.list_formats:
         list_formats(args.url, args.browser)
         return
-
-    # --summary implies --full
-    if args.summary:
-        args.full = True
 
     success = download_video(
         url=args.url,
