@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Xiaohongshu (小红书/RedNote) Video Downloader v2.0
-Downloads videos from Xiaohongshu and optionally produces a full resource pack:
-video + audio + subtitles + transcript + AI summary.
+Xiaohongshu (小红书/RedNote) Downloader v2.6
+Supports both video posts and image posts.
+- Video post: always downloads full resource pack (video + audio + subtitles + transcript)
+- Image post: always downloads all images + post.txt + generates .meta.json for AI summary
 """
 
 import argparse
@@ -12,7 +13,6 @@ import json
 import re
 import os
 import glob as globmod
-from pathlib import Path
 
 
 def check_yt_dlp():
@@ -38,10 +38,16 @@ def check_ffmpeg():
         return False
 
 
+def _normalize_url(url):
+    """Convert rednote.com URLs to xiaohongshu.com so yt-dlp can handle them."""
+    return url.replace('www.rednote.com', 'www.xiaohongshu.com')
+
+
 def validate_url(url):
     """Validate that the URL is a Xiaohongshu URL."""
     patterns = [
         r'https?://www\.xiaohongshu\.com/(?:explore|discovery/item)/[\da-f]+',
+        r'https?://www\.rednote\.com/(?:explore|discovery/item)/[\da-f]+',
         r'https?://xhslink\.com/',
     ]
     for pattern in patterns:
@@ -52,6 +58,7 @@ def validate_url(url):
 
 def get_video_info(url, browser="chrome"):
     """Get video information without downloading."""
+    url = _normalize_url(url)
     cmd = ["yt-dlp", "--dump-json", "--no-playlist"]
     if browser and browser != "none":
         cmd.extend(["--cookies-from-browser", browser])
@@ -65,16 +72,32 @@ def get_video_info(url, browser="chrome"):
         if "Unable to extract initial state" in stderr:
             print("Error: Anti-scraping CAPTCHA triggered.")
             print("Solution: Open the URL in your browser, solve the CAPTCHA, then retry.")
+            return None
         elif "No video formats found" in stderr:
-            print("Error: No video formats found.")
-            print("Solution: Make sure you're logged into xiaohongshu.com in your browser.")
+            # Could be an image post OR a video post yt-dlp can't extract.
+            # Verify by checking the mobile page type field.
+            html = _fetch_mobile_page(url, browser)
+            post_type, image_urls, scraped_title, scraped_desc = _parse_mobile_state(html)
+            id_match = re.search(r'/explore/([0-9a-f]+)', url)
+            post_id = id_match.group(1) if id_match else 'unknown'
+            if post_type == 'normal' and image_urls:
+                return {
+                    '_is_image_post': True,
+                    '_image_urls': image_urls,
+                    'title': scraped_title or post_id,
+                    'uploader': 'Unknown',
+                    'description': scraped_desc,
+                }
+            # type == 'video' or unknown → yt-dlp failed on a video post
+            return None
         else:
             print(f"Error getting video info: {stderr}")
-        return None
+            return None
 
 
 def list_formats(url, browser="chrome"):
     """List all available formats for the video."""
+    url = _normalize_url(url)
     cmd = ["yt-dlp", "--list-formats", "--no-playlist"]
     if browser and browser != "none":
         cmd.extend(["--cookies-from-browser", browser])
@@ -92,6 +115,297 @@ def sanitize_title(title):
     if len(sanitized) > 100:
         sanitized = sanitized[:100].rstrip()
     return sanitized or "untitled"
+
+
+def detect_post_type(info):
+    """Return 'video' or 'image' based on yt-dlp info dict."""
+    if not info:
+        return 'video'
+    if info.get('_is_image_post'):
+        return 'image'
+    formats = info.get('formats', [])
+    has_video_stream = any(
+        f.get('vcodec') not in (None, 'none', '')
+        for f in formats
+    )
+    if has_video_stream:
+        return 'video'
+    return 'image'
+
+
+_MOBILE_UA = (
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) '
+    'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
+)
+
+
+def _parse_mobile_state(html):
+    """Parse window.__INITIAL_STATE__ from mobile-UA page response.
+
+    XHS serves a different SSR payload for mobile UAs that includes the full
+    note data (type, imageList, title, desc) under state.noteData.data.noteData.
+
+    Returns (post_type, image_urls, title, description) or ('unknown', [], '', '') on failure.
+    post_type is 'video', 'normal' (image post), or 'unknown'.
+    """
+    idx = html.find('window.__INITIAL_STATE__')
+    if idx == -1:
+        return 'unknown', [], '', ''
+    raw = html[idx + len('window.__INITIAL_STATE__='):]
+    end = raw.find('</script>')
+    raw = raw[:end].rstrip('; \n\r')
+    raw = re.sub(r':\s*undefined\b', ': null', raw)
+    try:
+        state = json.loads(raw)
+    except json.JSONDecodeError:
+        return 'unknown', [], '', ''
+
+    note_data = state.get('noteData', {}).get('data', {}).get('noteData', {})
+    if not note_data:
+        return 'unknown', [], '', ''
+
+    post_type = note_data.get('type', 'unknown')  # 'video' or 'normal'
+    title = note_data.get('title', '')
+    description = note_data.get('desc', '')
+    image_list = note_data.get('imageList', [])
+
+    image_urls = []
+    for img in image_list:
+        # Prefer H5_DTL (1080px JPEG) from infoList, fall back to top-level url
+        url = ''
+        for entry in img.get('infoList', []):
+            if entry.get('imageScene') == 'H5_DTL':
+                url = entry.get('url', '')
+                break
+        if not url:
+            url = img.get('url', '') or img.get('urlDefault', '')
+        if url:
+            image_urls.append(url)
+
+    # For image posts, exclude the single cover image that also appears on video posts
+    if post_type == 'video':
+        image_urls = []
+
+    return post_type, image_urls, title, description
+
+
+def _fetch_mobile_page(url, browser='chrome'):
+    """Fetch a Xiaohongshu page with a mobile user-agent using yt-dlp's auth."""
+    import tempfile, urllib.request, http.cookiejar
+
+    # Export browser cookies to a temp file
+    cookie_file = os.path.join(tempfile.gettempdir(), 'xhs_cookies.txt')
+    subprocess.run(
+        ["yt-dlp", "--cookies-from-browser", browser,
+         "--cookies", cookie_file, "--skip-download", "--quiet", url],
+        capture_output=True)
+
+    cj = http.cookiejar.MozillaCookieJar()
+    if os.path.exists(cookie_file):
+        try:
+            cj.load(cookie_file, ignore_discard=True, ignore_expires=True)
+        except Exception:
+            pass
+
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+    opener.addheaders = [
+        ('User-Agent', _MOBILE_UA),
+        ('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'),
+        ('Accept-Language', 'zh-CN,zh;q=0.9'),
+        ('Referer', 'https://www.xiaohongshu.com/'),
+    ]
+    try:
+        return opener.open(url, timeout=30).read().decode('utf-8', errors='ignore')
+    except Exception as e:
+        print(f"Warning: Mobile page fetch failed: {e}")
+        return ''
+
+
+def _extract_video_url_from_mobile(html):
+    """Extract best video stream URL and metadata from mobile page state.
+
+    Returns (video_url, title, description) or (None, '', '') on failure.
+    Prefers h264 for compatibility; picks highest-height stream.
+    """
+    idx = html.find('window.__INITIAL_STATE__')
+    if idx == -1:
+        return None, '', ''
+    raw = html[idx + len('window.__INITIAL_STATE__='):]
+    raw = raw[:raw.find('</script>')].rstrip('; \n\r')
+    raw = re.sub(r':\s*undefined\b', ': null', raw)
+    try:
+        state = json.loads(raw)
+    except json.JSONDecodeError:
+        return None, '', ''
+
+    note_data = state.get('noteData', {}).get('data', {}).get('noteData', {})
+    if not note_data:
+        return None, '', ''
+
+    description = note_data.get('desc', '')
+    raw_title = note_data.get('title', '').strip()
+    if not raw_title:
+        # Use first non-empty, non-hashtag line of desc as fallback title
+        for line in description.splitlines():
+            line = line.strip()
+            if line and not line.startswith('#'):
+                raw_title = line
+                break
+    title = raw_title
+    streams = note_data.get('video', {}).get('media', {}).get('stream', {})
+
+    # Prefer h264 (widest compatibility), fall back to h265
+    for codec in ('h264', 'h265', 'av1'):
+        entries = streams.get(codec, [])
+        if entries:
+            best = max(entries, key=lambda s: s.get('height', 0))
+            url = best.get('masterUrl', '')
+            if url:
+                return url, title, description
+
+    return None, title, description
+
+
+def _download_image_urls(image_urls, output_dir):
+    """Download a list of image URLs into output_dir, named 01.jpg, 02.jpg, …"""
+    import urllib.request
+    downloaded = []
+    for i, img_url in enumerate(image_urls, 1):
+        # Determine extension: prefer explicit suffix in URL, default jpg
+        ext_match = re.search(r'!h5_\d+([a-z]+)$', img_url)
+        if ext_match:
+            ext = ext_match.group(1)
+        else:
+            ext_match2 = re.search(r'\.(jpe?g|png|webp|gif)(?:[?!@]|$)', img_url, re.IGNORECASE)
+            ext = ext_match2.group(1).lower() if ext_match2 else 'jpg'
+        dest = os.path.join(output_dir, f"{i:02d}.{ext}")
+        try:
+            req = urllib.request.Request(img_url, headers={
+                'User-Agent': _MOBILE_UA,
+                'Referer': 'https://www.xiaohongshu.com/',
+            })
+            with urllib.request.urlopen(req, timeout=30) as resp, open(dest, 'wb') as f:
+                f.write(resp.read())
+            size_kb = os.path.getsize(dest) / 1024
+            print(f"  {i:02d}.{ext:4s}  {size_kb:.1f} KB")
+            downloaded.append(dest)
+        except Exception as e:
+            print(f"  Warning: Failed to download image {i}: {e}")
+    return downloaded
+
+
+def download_image_post(url, info, output_path, browser="chrome", summary_mode=True):
+    """Download all images and text from a Xiaohongshu image post."""
+    url = _normalize_url(url)
+
+    id_match = re.search(r'/explore/([0-9a-f]+)', url)
+    post_id = id_match.group(1) if id_match else 'unknown'
+
+    title = (info.get('title', '') if info else '') or post_id
+    description = info.get('description', '') if info else ''
+    uploader = info.get('uploader', 'Unknown') if info else 'Unknown'
+
+    safe_title = sanitize_title(title)
+    output_dir = os.path.join(output_path, safe_title)
+    os.makedirs(output_dir, exist_ok=True)
+
+    print(f"Post ID: {post_id}")
+    print(f"Uploader: {uploader}")
+    print(f"Type: image post")
+    print(f"Output: {output_dir}\n")
+
+    image_exts = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+
+    # Use pre-fetched image URLs from get_video_info if available (avoids redundant request)
+    prefetched_urls = (info or {}).get('_image_urls', [])
+
+    if prefetched_urls:
+        print(f"Downloading {len(prefetched_urls)} image(s)...")
+        _download_image_urls(prefetched_urls, output_dir)
+    else:
+        # Fallback: fetch mobile page to get image URLs
+        print("Fetching image URLs from mobile page...")
+        html = _fetch_mobile_page(url, browser) if browser and browser != "none" else ''
+        _, image_urls, scraped_title, scraped_desc = _parse_mobile_state(html)
+
+        if image_urls:
+            print(f"Found {len(image_urls)} image(s). Downloading...")
+            _download_image_urls(image_urls, output_dir)
+
+        if scraped_title and scraped_title != post_id:
+            title = scraped_title
+            new_safe = sanitize_title(title)
+            new_dir = os.path.join(output_path, new_safe)
+            if new_dir != output_dir:
+                if not os.path.exists(new_dir):
+                    os.rename(output_dir, new_dir)
+                    output_dir = new_dir
+                else:
+                    for fname in os.listdir(output_dir):
+                        src = os.path.join(output_dir, fname)
+                        dst = os.path.join(new_dir, fname)
+                        if not os.path.exists(dst):
+                            os.rename(src, dst)
+                    try:
+                        os.rmdir(output_dir)
+                    except OSError:
+                        pass
+                    output_dir = new_dir
+        if scraped_desc:
+            description = scraped_desc
+
+    downloaded_images = sorted([
+        f for f in os.listdir(output_dir)
+        if os.path.splitext(f)[1].lower() in image_exts
+    ])
+
+    if not downloaded_images:
+        print("\nError: Could not download images.")
+        print("Tips:")
+        print("  1. Make sure you are logged into xiaohongshu.com in Chrome")
+        print("  2. Try opening the URL in your browser first, then retry")
+        return False
+
+    print(f"\nDownloaded {len(downloaded_images)} image(s).")
+
+    # Save title + description to post.txt
+    text_path = os.path.join(output_dir, "post.txt")
+    with open(text_path, "w", encoding="utf-8") as f:
+        f.write(f"{title}\n")
+        if description and description.strip() != title.strip():
+            f.write(f"\n{description}\n")
+    print(f"Text saved: {text_path}")
+
+    # Save metadata for Claude to use when generating summary
+    if summary_mode:
+        meta_path = os.path.join(output_dir, ".meta.json")
+        meta = {
+            "title": title,
+            "url": url,
+            "platform": "Xiaohongshu (小红书)",
+            "uploader": uploader,
+            "post_type": "image",
+            "image_count": len(downloaded_images),
+            "image_files": downloaded_images,
+        }
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        print(f"Metadata saved: {meta_path}")
+        print("Summary mode enabled — Claude will generate summary.md by reading the images.")
+
+    # Print summary
+    print(f"\n{'='*50}")
+    print(f"Title: {title}")
+    print(f"Resource pack saved to: {output_dir}")
+    print(f"{'='*50}")
+    for img in downloaded_images:
+        size_kb = os.path.getsize(os.path.join(output_dir, img)) / 1024
+        print(f"  {img:20s} {size_kb:>8.1f} KB")
+    print(f"  {'post.txt':20s} (title + description)")
+    if summary_mode:
+        print(f"  {'.meta.json':20s} (metadata for summary)")
+
+    return True
 
 
 def extract_audio(video_path, output_dir):
@@ -304,7 +618,9 @@ def download_video(url, output_path=None, quality="best", browser="chrome",
     if output_path is None:
         output_path = os.path.expanduser("~/Downloads")
 
-    # Get video info first
+    url = _normalize_url(url)
+
+    # Get post info first
     info = get_video_info(url, browser)
     title = "Unknown"
     duration = 0
@@ -313,6 +629,52 @@ def download_video(url, output_path=None, quality="best", browser="chrome",
         title = info.get("title", "Unknown")
         duration = int(info.get("duration", 0) or 0)
         uploader = info.get("uploader", "Unknown")
+
+    # Detect post type and dispatch to image handler if needed
+    post_type = detect_post_type(info)
+    if post_type == 'image':
+        print("Detected: image post (no video stream)\n")
+        return download_image_post(url, info, output_path, browser, summary_mode=True)
+
+    # If yt-dlp couldn't extract info (info is None), try direct mobile video download
+    video_path = None
+
+    if info is None:
+        # yt-dlp failed — fall back to direct mobile video download
+        print("yt-dlp extraction failed. Trying direct mobile video download...")
+        html = _fetch_mobile_page(url, browser) if browser and browser != "none" else ''
+        video_url, mobile_title, mobile_desc = _extract_video_url_from_mobile(html)
+        if not video_url:
+            print("Error: Could not extract video URL from mobile page.")
+            return False
+        title = mobile_title or title
+        safe_title = sanitize_title(title)
+        output_dir = os.path.join(output_path, safe_title)
+        os.makedirs(output_dir, exist_ok=True)
+        dest_path = os.path.join(output_dir, "video.mp4")
+        print(f"Title: {title}")
+        print(f"Downloading video directly: {video_url[:80]}...")
+        import urllib.request
+        req = urllib.request.Request(video_url, headers={
+            'User-Agent': _MOBILE_UA,
+            'Referer': 'https://www.xiaohongshu.com/',
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp, open(dest_path, 'wb') as f:
+                while True:
+                    chunk = resp.read(1024 * 64)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            size_mb = os.path.getsize(dest_path) / (1024 * 1024)
+            print(f"Downloaded: {dest_path} ({size_mb:.1f} MB)")
+        except Exception as e:
+            print(f"Error downloading video: {e}")
+            return False
+        video_path = dest_path
+
+    else:
+        # --- Video post (yt-dlp succeeded) ---
         if duration:
             print(f"Title: {title}")
             print(f"Duration: {duration // 60}:{duration % 60:02d}")
@@ -321,96 +683,90 @@ def download_video(url, output_path=None, quality="best", browser="chrome",
             print(f"Title: {title}")
             print(f"Uploader: {uploader}\n")
 
-    # Determine output directory
-    if full_mode:
-        safe_title = sanitize_title(title)
-        output_dir = os.path.join(output_path, safe_title)
-        os.makedirs(output_dir, exist_ok=True)
-        video_output = os.path.join(output_dir, "video.%(ext)s")
-    else:
-        output_dir = output_path
-        video_output = os.path.join(output_path, "%(title)s [%(id)s].%(ext)s")
-
-    # Build yt-dlp command
-    cmd = ["yt-dlp"]
-
-    if browser and browser != "none":
-        cmd.extend(["--cookies-from-browser", browser])
-
-    if audio_only:
-        cmd.extend([
-            "-x",
-            "--audio-format", "mp3",
-            "--audio-quality", "0",
-        ])
-    else:
-        if quality == "best":
-            format_string = "bestvideo+bestaudio/best"
+        # Determine output directory
+        if full_mode:
+            safe_title = sanitize_title(title)
+            output_dir = os.path.join(output_path, safe_title)
+            os.makedirs(output_dir, exist_ok=True)
+            video_output = os.path.join(output_dir, "video.%(ext)s")
         else:
-            height = quality.replace("p", "")
-            format_string = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
+            output_dir = output_path
+            video_output = os.path.join(output_path, "%(title)s [%(id)s].%(ext)s")
+
+        # Build yt-dlp command
+        cmd = ["yt-dlp"]
+
+        if browser and browser != "none":
+            cmd.extend(["--cookies-from-browser", browser])
+
+        if audio_only:
+            cmd.extend([
+                "-x",
+                "--audio-format", "mp3",
+                "--audio-quality", "0",
+            ])
+        else:
+            if quality == "best":
+                format_string = "bestvideo+bestaudio/best"
+            else:
+                height = quality.replace("p", "")
+                format_string = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
+
+            cmd.extend([
+                "-f", format_string,
+                "--merge-output-format", "mp4",
+            ])
 
         cmd.extend([
-            "-f", format_string,
-            "--merge-output-format", "mp4",
+            "-o", video_output,
+            "--no-playlist",
         ])
+        cmd.append(url)
 
-    cmd.extend([
-        "-o", video_output,
-        "--no-playlist",
-    ])
-    cmd.append(url)
+        print(f"URL: {url}")
+        print(f"Quality: {quality}")
+        print(f"Format: {'mp3 (audio only)' if audio_only else 'mp4'}")
+        print(f"Mode: {'full resource pack' if full_mode else 'video only'}")
+        print(f"Cookies: from {browser}" if browser != "none" else "Cookies: none")
+        print(f"Output: {output_dir}\n")
 
-    print(f"URL: {url}")
-    print(f"Quality: {quality}")
-    print(f"Format: {'mp3 (audio only)' if audio_only else 'mp4'}")
-    print(f"Mode: {'full resource pack' if full_mode else 'video only'}")
-    print(f"Cookies: from {browser}" if browser != "none" else "Cookies: none")
-    print(f"Output: {output_dir}\n")
+        try:
+            subprocess.run(cmd, check=True)
+            print(f"\nVideo download complete!")
+        except subprocess.CalledProcessError as e:
+            print(f"\nError downloading video: {e}")
+            print("\nTroubleshooting tips:")
+            print("1. Make sure you're logged into xiaohongshu.com in your browser")
+            print("2. Try copying a fresh share link (tokens expire)")
+            print("3. If CAPTCHA appears, open the URL in browser first")
+            return False
 
-    # Download video
-    try:
-        subprocess.run(cmd, check=True)
-        print(f"\nVideo download complete!")
-    except subprocess.CalledProcessError as e:
-        print(f"\nError downloading video: {e}")
-        print("\nTroubleshooting tips:")
-        print("1. Make sure you're logged into xiaohongshu.com in your browser")
-        print("2. Try copying a fresh share link (tokens expire)")
-        print("3. If CAPTCHA appears, open the URL in browser first")
-        return False
+        if not full_mode:
+            print(f"Saved to: {output_dir}")
+            return True
 
-    if not full_mode:
-        print(f"Saved to: {output_dir}")
-        return True
+        # Find the downloaded video file
+        for ext in ["mp4", "mkv", "webm"]:
+            candidate = os.path.join(output_dir, f"video.{ext}")
+            if os.path.exists(candidate):
+                video_path = candidate
+                break
 
-    # --- Full resource pack mode ---
-    # Find the downloaded video file
-    video_path = None
-    for ext in ["mp4", "mkv", "webm"]:
-        candidate = os.path.join(output_dir, f"video.{ext}")
-        if os.path.exists(candidate):
-            video_path = candidate
-            break
+        if not video_path:
+            print("Warning: Could not find downloaded video file for further processing.")
+            return True
 
-    if not video_path:
-        print("Warning: Could not find downloaded video file for further processing.")
-        return True
-
-    # Step: Extract audio
+    # --- Full resource pack pipeline (shared by both download paths) ---
     print("\n--- Extracting audio ---")
     audio_path = extract_audio(video_path, output_dir)
 
-    # Step: Get subtitles
     print("\n--- Acquiring subtitles ---")
     vtt_path = download_subtitles(url, output_dir, browser, audio_path)
 
-    # Step: Generate transcript from subtitles
     if vtt_path:
         print("\n--- Generating transcript ---")
         generate_transcript(vtt_path, output_dir)
 
-    # If summary mode requested, write metadata for Claude to use
     if summary_mode:
         meta_path = os.path.join(output_dir, ".meta.json")
         meta = {
@@ -425,7 +781,6 @@ def download_video(url, output_path=None, quality="best", browser="chrome",
         print(f"\nMetadata saved: {meta_path}")
         print("Summary mode enabled — Claude will generate summary.md using the transcript.")
 
-    # Print summary
     print(f"\n{'='*50}")
     print(f"Resource pack saved to: {output_dir}")
     print(f"{'='*50}")
@@ -440,11 +795,88 @@ def download_video(url, output_path=None, quality="best", browser="chrome",
     return True
 
 
+def _read_batch_file(filepath):
+    """Return list of (line_index, url) for all pending (non-done, non-blank, non-comment) lines."""
+    with open(filepath, encoding='utf-8') as f:
+        lines = f.readlines()
+    pending = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        url = stripped.split()[0]
+        pending.append((i, url))
+    return pending
+
+
+def _mark_done(filepath, line_index):
+    """Prefix a line in the batch file with '# [done] ' to skip it on future runs."""
+    with open(filepath, encoding='utf-8') as f:
+        lines = f.readlines()
+    lines[line_index] = '# [done] ' + lines[line_index]
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.writelines(lines)
+
+
+def batch_download(filepath, output_path, quality, browser, audio_only, full_mode, summary_mode):
+    """Download all pending URLs in a batch file, marking each done after success."""
+    if not os.path.exists(filepath):
+        print(f"Error: batch file not found: {filepath}")
+        return False
+
+    pending = _read_batch_file(filepath)
+    if not pending:
+        print("No pending URLs found in batch file.")
+        return True
+
+    print(f"Found {len(pending)} pending URL(s) in {filepath}\n")
+
+    results = []
+    for i, (line_idx, url) in enumerate(pending, 1):
+        print(f"{'='*60}")
+        print(f"[{i}/{len(pending)}] {url}")
+        print(f"{'='*60}")
+        try:
+            success = download_video(
+                url=url,
+                output_path=output_path,
+                quality=quality,
+                browser=browser,
+                audio_only=audio_only,
+                full_mode=full_mode,
+                summary_mode=summary_mode,
+            )
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            success = False
+
+        results.append((url, success))
+        if success:
+            _mark_done(filepath, line_idx)
+            print(f"\n[done] Marked as complete in batch file.\n")
+        else:
+            print(f"\n[failed] URL kept in batch file for retry.\n")
+
+    print(f"{'='*60}")
+    print(f"Batch complete: {sum(s for _, s in results)}/{len(results)} succeeded")
+    failed = [u for u, s in results if not s]
+    if failed:
+        print("Failed URLs (still in batch file):")
+        for u in failed:
+            print(f"  {u}")
+    return all(s for _, s in results)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Download Xiaohongshu (小红书) videos using yt-dlp"
     )
-    parser.add_argument("url", help="Xiaohongshu video URL (explore, discovery, or xhslink.com)")
+    parser.add_argument("url", nargs='?', help="Xiaohongshu video URL (explore, discovery, or xhslink.com)")
+    parser.add_argument(
+        "--batch",
+        metavar="FILE",
+        help="Batch download: read URLs from FILE, mark each done after success"
+    )
     parser.add_argument(
         "-o", "--output",
         default=None,
@@ -475,17 +907,39 @@ def main():
     parser.add_argument(
         "--full",
         action="store_true",
+        default=True,
         help="Full resource pack: video + audio + subtitles + transcript"
     )
     parser.add_argument(
         "--summary",
         action="store_true",
+        default=True,
         help="Enable AI summary mode (saves metadata for Claude to generate summary.md)"
     )
 
     args = parser.parse_args()
 
-    # Validate URL
+    if not args.url and not args.batch:
+        parser.error("provide a URL or --batch FILE")
+
+    # --summary implies --full
+    if args.summary:
+        args.full = True
+
+    # Batch mode
+    if args.batch:
+        success = batch_download(
+            filepath=args.batch,
+            output_path=args.output,
+            quality=args.quality,
+            browser=args.browser,
+            audio_only=args.audio_only,
+            full_mode=args.full,
+            summary_mode=args.summary,
+        )
+        sys.exit(0 if success else 1)
+
+    # Single URL mode
     if not validate_url(args.url):
         print("Warning: URL does not match known Xiaohongshu patterns.")
         print("Supported formats:")
@@ -497,10 +951,6 @@ def main():
     if args.list_formats:
         list_formats(args.url, args.browser)
         return
-
-    # --summary implies --full
-    if args.summary:
-        args.full = True
 
     success = download_video(
         url=args.url,
