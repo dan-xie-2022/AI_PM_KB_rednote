@@ -42,3 +42,7 @@ cookies.txt
 
 # Whisper temp segments
 whisper_segments_*/
+
+# Personal downloaded content
+content/
+download_list.md
